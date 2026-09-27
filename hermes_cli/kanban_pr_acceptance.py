@@ -10,6 +10,8 @@ import re
 import subprocess
 from urllib.parse import quote
 
+from hermes_cli.kanban_code_evidence import CODE_EVIDENCE_CONTRACT
+
 _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _PR = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)")
 
@@ -17,8 +19,14 @@ _PR = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([
 def validate_contract(value: str | None) -> str:
     if value is None or value == "local-only":
         return "local-only"
+    if value == CODE_EVIDENCE_CONTRACT:
+        return CODE_EVIDENCE_CONTRACT
+    if value == "qa-live-evidence":
+        return "qa-live-evidence"
     if not isinstance(value, str) or not (_REPO.fullmatch(value) or _PR.fullmatch(value)):
-        raise ValueError("completion_contract must be local-only, OWNER/REPO, or an exact GitHub PR URL")
+        raise ValueError(
+            "completion_contract must be local-only, qa-live-evidence, code-evidence, OWNER/REPO, or an exact GitHub PR URL"
+        )
     return value
 
 

@@ -998,6 +998,19 @@ CREATE TABLE IF NOT EXISTS task_events (
     created_at INTEGER NOT NULL
 );
 
+-- A narrowly-scoped, administrator-created exception for the one bootstrap
+-- task that introduces a new completion control. Workers have no tool or
+-- worker-facing API that can create or alter these rows. The acceptance store
+-- consumes a live grant atomically before it permits completion.
+CREATE TABLE IF NOT EXISTS kanban_bootstrap_grants (
+    task_id         TEXT PRIMARY KEY,
+    granted_by      TEXT NOT NULL,
+    granted_at      INTEGER NOT NULL,
+    expires_at      INTEGER NOT NULL,
+    consumed_at     INTEGER,
+    consumed_run_id INTEGER
+);
+
 -- Historical attempt record. Each time the dispatcher claims a task, a
 -- new row is created here; claim state, PID, heartbeat, runtime cap,
 -- and structured summary all live on the run, not the task. Multiple
@@ -1074,6 +1087,7 @@ CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
 CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_bootstrap_grants_live ON kanban_bootstrap_grants(expires_at, consumed_at);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
