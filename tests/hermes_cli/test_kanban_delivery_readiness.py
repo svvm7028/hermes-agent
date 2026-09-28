@@ -45,6 +45,10 @@ def _ready(*, assignee: str = "developer", workspace_kind: str = "worktree") -> 
             "next_action": "Route to the declared developer workspace.",
         },
         "routing": {"assignee": assignee, "workspace_kind": workspace_kind},
+        "quality_plan": {
+            "release_critical": False,
+            "classification_rationale": "This admission-control unit is not itself a product release campaign.",
+        },
     }
 
 
@@ -92,6 +96,46 @@ def test_dop_em_card_persists_normalized_readiness_for_readback(tmp_path, monkey
         assert conn.execute(
             "SELECT count(*) FROM kanban_delivery_readiness WHERE task_id=?", (task_id,)
         ).fetchone()[0] == 1
+
+
+def test_release_critical_card_requires_harness_plan(tmp_path, monkeypatch):
+    _setup_board(tmp_path, monkeypatch)
+    with kbc.connect_closing() as conn:
+        missing = _ready()
+        del missing["quality_plan"]
+        with pytest.raises(ValueError, match="quality_plan must be an object"):
+            kb.create_task(
+                conn, title="Missing quality classification", assignee="developer",
+                workspace_kind="worktree", created_by="director-products",
+                delivery_readiness=missing,
+            )
+        critical = _ready()
+        critical["quality_plan"] = {
+            "release_critical": True,
+            "classification_rationale": "This card governs a release-critical campaign.",
+        }
+        critical["routing"] = {"assignee": "qa-analyst", "workspace_kind": "scratch"}
+        with pytest.raises(ValueError, match="qa_harness must be an object"):
+            kb.create_task(
+                conn, title="Missing harness plan", assignee="qa-analyst",
+                workspace_kind="scratch", created_by="director-products",
+                delivery_readiness=critical,
+            )
+        critical["quality_plan"]["qa_harness"] = {
+            "completion_contract": "qa-live-evidence",
+            "scenario_plan": ["Smoke", "Regression"],
+            "environment_invariants": ["Production disabled before and after"],
+            "circuit_breaker": {"max_consecutive_failures": 2},
+            "founder_digest_fields": ["Gate evidence", "Actual route", "Cost status", "Next decision"],
+        }
+        task_id = kb.create_task(
+            conn, title="Harness-governed QA", assignee="qa-analyst",
+            workspace_kind="scratch", created_by="director-products",
+            completion_contract="qa-live-evidence", delivery_readiness=critical,
+        )
+        stored = kb.get_delivery_readiness(conn, task_id)
+        assert stored is not None
+        assert stored["quality_plan"]["qa_harness"]["completion_contract"] == "qa-live-evidence"
 
 
 def test_non_dop_creator_is_not_retroactively_subject_to_new_gate(tmp_path, monkeypatch):

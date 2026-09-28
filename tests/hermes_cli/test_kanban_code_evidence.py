@@ -252,8 +252,8 @@ def test_non_worktree_not_affected(tmp_path, monkeypatch):
         assert task is not None and task.status == "done"
 
 
-def test_qa_live_evidence_unaffected(tmp_path, monkeypatch):
-    """Existing qa-live-evidence contract path is unaffected."""
+def test_qa_live_evidence_uses_its_own_artifact_gate(tmp_path, monkeypatch):
+    """QA evidence is rejected by its own artifact gate, not code evidence."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     kb.init_db()
     with connect() as conn:
@@ -263,7 +263,7 @@ def test_qa_live_evidence_unaffected(tmp_path, monkeypatch):
             completion_contract="qa-live-evidence",
             assignee="qa-analyst",
         )
-        # qa-live-evidence has different validation (needs live_runs etc)
+        # qa-live-evidence has its own tamper-evident artifact validation.
         # but it should not be intercepted by the code-evidence classification rule
         assert not kb.complete_task(conn, tid, summary="Incomplete QA", metadata={"cron_before_enabled": False})
         task = kb.get_task(conn, tid)
@@ -274,8 +274,7 @@ def test_qa_live_evidence_unaffected(tmp_path, monkeypatch):
         ).fetchall()
         assert receipts
         payload = json.loads(receipts[-1][0])
-        # qa-live-evidence rejects for different reasons
-        assert "live_runs" in payload.get("detail", "") or "live_runs" in str(payload)
+        assert "evidence_artifact" in payload.get("detail", "")
 
 
 def _bootstrap_task(conn, repo):

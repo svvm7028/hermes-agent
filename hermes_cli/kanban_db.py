@@ -1305,12 +1305,15 @@ def _validate_delivery_readiness(
     invest = readiness.get("invest")
     contract = readiness.get("card_contract")
     routing = readiness.get("routing")
+    quality = readiness.get("quality_plan")
     if not isinstance(invest, dict):
         raise ValueError("delivery_readiness.invest must be an object")
     if not isinstance(contract, dict):
         raise ValueError("delivery_readiness.card_contract must be an object")
     if not isinstance(routing, dict):
         raise ValueError("delivery_readiness.routing must be an object")
+    if not isinstance(quality, dict):
+        raise ValueError("delivery_readiness.quality_plan must be an object")
 
     normalized_invest = {
         name: _nonempty_text(invest.get(name), f"invest.{name}") for name in _INVEST_FIELDS
@@ -1350,10 +1353,36 @@ def _validate_delivery_readiness(
         raise ValueError("delivery_readiness.routing.assignee must match the task assignee")
     if routed_workspace != workspace_kind:
         raise ValueError("delivery_readiness.routing.workspace_kind must match the task workspace_kind")
+    release_critical = quality.get("release_critical")
+    if not isinstance(release_critical, bool):
+        raise ValueError("delivery_readiness.quality_plan.release_critical must be boolean")
+    normalized_quality: dict[str, Any] = {
+        "release_critical": release_critical,
+        "classification_rationale": _nonempty_text(
+            quality.get("classification_rationale"), "quality_plan.classification_rationale",
+        ),
+    }
+    if release_critical:
+        harness = quality.get("qa_harness")
+        if not isinstance(harness, dict):
+            raise ValueError("delivery_readiness.quality_plan.qa_harness must be an object for release-critical work")
+        if harness.get("completion_contract") != "qa-live-evidence":
+            raise ValueError("delivery_readiness.quality_plan.qa_harness.completion_contract must equal qa-live-evidence")
+        breaker = harness.get("circuit_breaker")
+        if not isinstance(breaker, dict) or not isinstance(breaker.get("max_consecutive_failures"), int) or breaker["max_consecutive_failures"] < 1:
+            raise ValueError("delivery_readiness.quality_plan.qa_harness.circuit_breaker.max_consecutive_failures must be a positive integer")
+        normalized_quality["qa_harness"] = {
+            "completion_contract": "qa-live-evidence",
+            "scenario_plan": _nonempty_text_list(harness.get("scenario_plan"), "quality_plan.qa_harness.scenario_plan"),
+            "environment_invariants": _nonempty_text_list(harness.get("environment_invariants"), "quality_plan.qa_harness.environment_invariants"),
+            "circuit_breaker": {"max_consecutive_failures": breaker["max_consecutive_failures"]},
+            "founder_digest_fields": _nonempty_text_list(harness.get("founder_digest_fields"), "quality_plan.qa_harness.founder_digest_fields"),
+        }
     return {
         "invest": normalized_invest,
         "card_contract": normalized_contract,
         "routing": {"assignee": routed_assignee, "workspace_kind": routed_workspace},
+        "quality_plan": normalized_quality,
     }
 
 

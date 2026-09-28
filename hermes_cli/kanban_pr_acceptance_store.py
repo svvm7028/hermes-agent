@@ -64,7 +64,9 @@ def prepare_acceptance(conn, task_id, expected_run_id, metadata):
     if status not in {"running", "ready", "blocked", "review"} or (expected_run_id is not None and run_id != expected_run_id):
         return False
     if contract == QA_LIVE_EVIDENCE_CONTRACT:
-        return snapshot, collect_qa_acceptance(metadata)
+        return snapshot, collect_qa_acceptance(
+            metadata, task_id=task_id, run_id=run_id,
+        )
     if contract == CODE_EVIDENCE_CONTRACT:
         return snapshot, collect_code_evidence(metadata, workspace_path or "")
     published_pr = metadata.get("published_pr") if isinstance(metadata, dict) else None

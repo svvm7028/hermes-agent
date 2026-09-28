@@ -1,10 +1,12 @@
-"""Structured acceptance for bounded live QA Kanban gates."""
+"""Structured acceptance for deterministic, artifact-backed live QA gates."""
 from __future__ import annotations
 
 from typing import Any
 
+from hermes_cli.qa_evidence_artifact import load_verified_qa_evidence
+from hermes_cli.qa_harness import HARNESS_STANDARD
+
 QA_LIVE_EVIDENCE_CONTRACT = "qa-live-evidence"
-_REQUIRED_ROLES = {"bull", "bear", "chief", "risk", "pm"}
 _ROUTE_FIELDS = ("initial_provider", "initial_model", "actual_provider", "actual_model", "transitions", "usage")
 _USAGE_FIELDS = ("input_tokens", "output_tokens", "cache_read_tokens", "context_window_tokens", "cost_status", "cost_usd")
 
@@ -45,28 +47,27 @@ def _route_error(run: dict, index: int) -> str | None:
     return None
 
 
-def collect_qa_acceptance(metadata: Any) -> dict:
-    """Return a machine-readable receipt for a live QA evidence handoff."""
+def collect_qa_acceptance(metadata: Any, *, task_id: str, run_id: int | None) -> dict:
+    """Validate an immutable harness artifact instead of worker-authored claims."""
     receipt = {
         "ok": False,
         "classification": "missing_evidence",
-        "required_roles": sorted(_REQUIRED_ROLES),
-        "recovery": "Supply complete structured live QA evidence and retry completion.",
+        "recovery": "Run the deterministic QA harness and supply its verified artifact reference.",
     }
     if not isinstance(metadata, dict):
         receipt["detail"] = "metadata must be an object for qa-live-evidence"
         return receipt
-    runs = metadata.get("live_runs")
-    if not isinstance(runs, list) or len(runs) < 10:
-        receipt["detail"] = "live_runs must contain at least 10 records"
+    evidence, artifact_error = load_verified_qa_evidence(
+        metadata.get("evidence_artifact"), task_id=task_id, run_id=run_id,
+    )
+    if artifact_error:
+        receipt["detail"] = artifact_error
         return receipt
-    if metadata.get("timeout_seconds") != 120:
-        receipt["detail"] = "timeout_seconds must equal 120"
+    assert evidence is not None
+    if evidence.get("harness_standard") != HARNESS_STANDARD:
+        receipt["detail"] = f"harness_standard must equal {HARNESS_STANDARD}"
         return receipt
-    if metadata.get("cron_before_enabled") is not False or metadata.get("cron_after_enabled") is not False:
-        receipt["detail"] = "cron_before_enabled and cron_after_enabled must both be false"
-        return receipt
-    configured_route = metadata.get("configured_route")
+    configured_route = evidence.get("configured_route")
     if not isinstance(configured_route, list) or not configured_route:
         receipt["detail"] = "configured_route must contain the ordered configured provider/model route"
         return receipt
@@ -74,22 +75,36 @@ def collect_qa_acceptance(metadata: Any) -> dict:
         if not isinstance(entry, dict) or not isinstance(entry.get("provider"), str) or not entry["provider"].strip() or not isinstance(entry.get("model"), str) or not entry["model"].strip():
             receipt["detail"] = f"configured_route[{index}] must contain non-empty provider and model"
             return receipt
-    roles: set[str] = set()
-    first_attempt_valid = 0
-    final_valid = 0
+    matrix = evidence.get("scenario_matrix")
+    if not isinstance(matrix, list) or not matrix:
+        receipt["detail"] = "scenario_matrix must be a non-empty list"
+        return receipt
+    expected: dict[str, int] = {}
+    for item in matrix:
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str) or not item["id"].strip():
+            receipt["detail"] = "every scenario_matrix entry must have a non-empty id"
+            return receipt
+        repetitions = item.get("repetitions", 1)
+        if item["id"] in expected or not isinstance(repetitions, int) or repetitions < 1:
+            receipt["detail"] = "scenario ids must be unique and repetitions must be positive integers"
+            return receipt
+        expected[item["id"]] = repetitions
+    runs = evidence.get("live_runs")
+    if not isinstance(runs, list):
+        receipt["detail"] = "live_runs must be a list"
+        return receipt
+    observed = {key: 0 for key in expected}
     for index, run in enumerate(runs, start=1):
         if not isinstance(run, dict):
             receipt["detail"] = f"live_runs[{index}] must be an object"
             return receipt
-        role = run.get("role")
-        if role not in _REQUIRED_ROLES:
-            receipt["detail"] = f"live_runs[{index}].role must be one of {sorted(_REQUIRED_ROLES)}"
+        scenario_id = run.get("scenario_id")
+        if scenario_id not in expected:
+            receipt["detail"] = f"live_runs[{index}].scenario_id is not declared by scenario_matrix"
             return receipt
-        if not isinstance(run.get("attempt1_schema_valid"), bool) or not isinstance(run.get("final_schema_valid"), bool):
-            receipt["detail"] = f"live_runs[{index}] must declare boolean attempt1_schema_valid and final_schema_valid"
-            return receipt
-        if not isinstance(run.get("retry_invoked"), bool):
-            receipt["detail"] = f"live_runs[{index}].retry_invoked must be boolean"
+        observed[scenario_id] += 1
+        if run.get("timed_out") is not False or run.get("exit_code") != 0 or run.get("receipt_error") is not None or run.get("passed") is not True:
+            receipt["detail"] = f"live_runs[{index}] did not produce a successful deterministic receipt"
             return receipt
         if not isinstance(run.get("latency_seconds"), (int, float)) or run["latency_seconds"] < 0:
             receipt["detail"] = f"live_runs[{index}].latency_seconds must be non-negative"
@@ -98,30 +113,29 @@ def collect_qa_acceptance(metadata: Any) -> dict:
         if route_error:
             receipt["detail"] = route_error
             return receipt
-        roles.add(role)
-        first_attempt_valid += int(run["attempt1_schema_valid"])
-        final_valid += int(run["final_schema_valid"])
-    if roles != _REQUIRED_ROLES:
-        receipt["detail"] = f"live_runs must cover every role; observed {sorted(roles)}"
+    if observed != expected:
+        receipt["detail"] = f"scenario coverage mismatch: expected {expected}, observed {observed}"
         return receipt
-    if final_valid != len(runs):
-        receipt["detail"] = "every live run must be schema-valid after the implementation's bounded retry"
+    expected_count = sum(expected.values())
+    if evidence.get("expected_run_count") != expected_count or evidence.get("completed_run_count") != len(runs):
+        receipt["detail"] = "run-count aggregates do not match scenario_matrix/live_runs"
         return receipt
-    if metadata.get("first_attempt_schema_valid_count") != first_attempt_valid:
-        receipt["detail"] = "first_attempt_schema_valid_count does not match live_runs"
+    if evidence.get("passed_run_count") != len(runs):
+        receipt["detail"] = "passed_run_count must equal the completed run count"
         return receipt
-    if metadata.get("final_schema_valid_count") != final_valid:
-        receipt["detail"] = "final_schema_valid_count does not match live_runs"
+    if evidence.get("terminal_state") != "complete":
+        receipt["detail"] = "terminal_state must be complete; circuit-open or incomplete campaigns cannot pass"
         return receipt
-    if not isinstance(metadata.get("evidence_artifact"), str) or not metadata["evidence_artifact"].strip():
-        receipt["detail"] = "evidence_artifact is required"
+    if evidence.get("environment_before") != evidence.get("environment_after"):
+        receipt["detail"] = "environment_before and environment_after must match"
         return receipt
     return {
         "ok": True,
         "classification": "success",
+        "harness_standard": HARNESS_STANDARD,
         "run_count": len(runs),
-        "first_attempt_schema_valid_count": first_attempt_valid,
-        "final_schema_valid_count": final_valid,
-        "roles": sorted(roles),
+        "scenarios": sorted(expected),
         "configured_route": configured_route,
+        "artifact_sha256": metadata["evidence_artifact"]["sha256"],
+        "candidate_sha": metadata["evidence_artifact"]["candidate_sha"],
     }
