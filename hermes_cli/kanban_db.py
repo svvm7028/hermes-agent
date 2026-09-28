@@ -1011,6 +1011,15 @@ CREATE TABLE IF NOT EXISTS kanban_bootstrap_grants (
     consumed_run_id INTEGER
 );
 
+-- Structured DOP/EM delivery-readiness record. This is deliberately a
+-- first-class row rather than prose in tasks.body: creation validation can
+-- fail closed and later review can read back the exact admission record.
+CREATE TABLE IF NOT EXISTS kanban_delivery_readiness (
+    task_id     TEXT PRIMARY KEY,
+    payload     TEXT NOT NULL,
+    created_at  INTEGER NOT NULL
+);
+
 -- Historical attempt record. Each time the dispatcher claims a task, a
 -- new row is created here; claim state, PID, heartbeat, runtime cap,
 -- and structured summary all live on the run, not the task. Multiple
@@ -1088,6 +1097,7 @@ CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
 CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_bootstrap_grants_live ON kanban_bootstrap_grants(expires_at, consumed_at);
+CREATE INDEX IF NOT EXISTS idx_delivery_readiness_created ON kanban_delivery_readiness(created_at);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
@@ -1266,6 +1276,95 @@ def _normalize_task_skills(skills: Optional[Iterable[str]]) -> Optional[list[str
     return cleaned
 
 
+_DOP_EM_PROFILE = "director-products"
+_INVEST_FIELDS = ("independent", "negotiable", "valuable", "estimable", "small", "testable")
+_CARD_CONTRACT_TEXT_FIELDS = (
+    "problem_outcome", "behavior_slice", "baseline", "escalation_ownership", "next_action",
+)
+_CARD_CONTRACT_LIST_FIELDS = ("acceptance_criteria", "definition_of_done", "evidence_required")
+
+
+def _nonempty_text(value: Any, path: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"delivery_readiness.{path} must be a non-empty string")
+    return value.strip()
+
+
+def _nonempty_text_list(value: Any, path: str) -> list[str]:
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"delivery_readiness.{path} must be a non-empty list of strings")
+    return [_nonempty_text(item, f"{path}[{idx}]") for idx, item in enumerate(value)]
+
+
+def _validate_delivery_readiness(
+    readiness: Any, *, assignee: Optional[str], workspace_kind: str,
+) -> dict[str, Any]:
+    """Validate DOP/EM's persisted INVEST/Card Contract admission record."""
+    if not isinstance(readiness, dict):
+        raise ValueError("delivery_readiness must be an object for DOP/EM-created cards")
+    invest = readiness.get("invest")
+    contract = readiness.get("card_contract")
+    routing = readiness.get("routing")
+    if not isinstance(invest, dict):
+        raise ValueError("delivery_readiness.invest must be an object")
+    if not isinstance(contract, dict):
+        raise ValueError("delivery_readiness.card_contract must be an object")
+    if not isinstance(routing, dict):
+        raise ValueError("delivery_readiness.routing must be an object")
+
+    normalized_invest = {
+        name: _nonempty_text(invest.get(name), f"invest.{name}") for name in _INVEST_FIELDS
+    }
+    normalized_contract: dict[str, Any] = {
+        name: _nonempty_text(contract.get(name), f"card_contract.{name}")
+        for name in _CARD_CONTRACT_TEXT_FIELDS
+    }
+    normalized_contract.update({
+        name: _nonempty_text_list(contract.get(name), f"card_contract.{name}")
+        for name in _CARD_CONTRACT_LIST_FIELDS
+    })
+    scope = contract.get("scope")
+    if not isinstance(scope, dict):
+        raise ValueError("delivery_readiness.card_contract.scope must be an object")
+    normalized_contract["scope"] = {
+        "in": _nonempty_text_list(scope.get("in"), "card_contract.scope.in"),
+        "out": _nonempty_text_list(scope.get("out"), "card_contract.scope.out"),
+    }
+    dependencies = contract.get("dependencies")
+    if not isinstance(dependencies, dict):
+        raise ValueError("delivery_readiness.card_contract.dependencies must be an object")
+    normalized_contract["dependencies"] = {
+        "order": _nonempty_text_list(dependencies.get("order"), "card_contract.dependencies.order"),
+    }
+    risk_rollback = contract.get("risk_rollback")
+    if not isinstance(risk_rollback, dict):
+        raise ValueError("delivery_readiness.card_contract.risk_rollback must be an object")
+    normalized_contract["risk_rollback"] = {
+        "risk": _nonempty_text(risk_rollback.get("risk"), "card_contract.risk_rollback.risk"),
+        "rollback": _nonempty_text(risk_rollback.get("rollback"), "card_contract.risk_rollback.rollback"),
+    }
+
+    routed_assignee = _nonempty_text(routing.get("assignee"), "routing.assignee")
+    routed_workspace = _nonempty_text(routing.get("workspace_kind"), "routing.workspace_kind")
+    if routed_assignee != (assignee or ""):
+        raise ValueError("delivery_readiness.routing.assignee must match the task assignee")
+    if routed_workspace != workspace_kind:
+        raise ValueError("delivery_readiness.routing.workspace_kind must match the task workspace_kind")
+    return {
+        "invest": normalized_invest,
+        "card_contract": normalized_contract,
+        "routing": {"assignee": routed_assignee, "workspace_kind": routed_workspace},
+    }
+
+
+def get_delivery_readiness(conn: sqlite3.Connection, task_id: str) -> Optional[dict[str, Any]]:
+    """Return the structured admission record for a task, if one was required."""
+    row = conn.execute(
+        "SELECT payload FROM kanban_delivery_readiness WHERE task_id=?", (task_id,)
+    ).fetchone()
+    return _json_or(row["payload"]) if row else None
+
+
 def create_task(
     conn: sqlite3.Connection, *, title: str, body: Optional[str] = None,
     assignee: Optional[str] = None, created_by: Optional[str] = None,
@@ -1280,6 +1379,7 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    delivery_readiness: Optional[dict[str, Any]] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1323,6 +1423,13 @@ def create_task(
             f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
             f"got {workspace_kind!r}"
         )
+    creator_is_dop_em = str(created_by or "").strip().casefold() == _DOP_EM_PROFILE
+    # DOP/EM cards require this record; other controlled creators may opt in
+    # and get the same validation/storage rather than silently dropping it.
+    normalized_readiness = (
+        _validate_delivery_readiness(delivery_readiness, assignee=assignee, workspace_kind=workspace_kind)
+        if creator_is_dop_em or delivery_readiness is not None else None
+    )
     if branch_name is not None:
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
@@ -1392,6 +1499,11 @@ def create_task(
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
                     ),
                 )
+                if normalized_readiness is not None:
+                    conn.execute(
+                        "INSERT INTO kanban_delivery_readiness (task_id, payload, created_at) VALUES (?, ?, ?)",
+                        (task_id, json.dumps(normalized_readiness, sort_keys=True), now),
+                    )
                 for pid in parents:
                     _link(conn, pid, task_id)
                 _append_event(

@@ -164,6 +164,9 @@ _SPECS = [
              help="Read the opening post from a file ('-' = stdin), so bodies with embedded "
                   "newlines or flag-like lines survive shell quoting. "
                   "Mutually exclusive with --body."),
+        _arg("--delivery-readiness-file", metavar="PATH",
+             help="JSON file containing the structured INVEST/Card Contract admission record. "
+                  "Required for DOP/EM-created cards; stored separately from the task body."),
         _arg("--assignee", help="Profile name to assign"),
         _arg("--parent", action="append", default=[], help="Parent task id (repeatable)"),
         _arg("--workspace",

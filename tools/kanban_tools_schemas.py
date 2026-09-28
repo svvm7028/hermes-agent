@@ -390,6 +390,12 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "links. The assigned worker reads this as part of "
                 "its context."
         )),
+        "delivery_readiness": _prop("object", (
+                "Required when the DOP/EM profile creates a card. Structured admission record: "
+                "invest (independent, negotiable, valuable, estimable, small, testable); "
+                "card_contract (outcome, slice, baseline, scope, dependencies, acceptance, DoD, "
+                "evidence, risk/rollback, escalation, next action); and routing matching assignee/workspace."
+        )),
         "parents": {
             "type": "array",
             "items": {"type": "string"},

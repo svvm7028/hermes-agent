@@ -343,6 +343,14 @@ def _cmd_create(args: argparse.Namespace) -> int:
             body = sys.stdin.read() if body_file == "-" else Path(body_file).read_text(encoding="utf-8-sig")
         except OSError as exc:
             return _err(f"kanban: --body-file: {exc}", 2)
+    delivery_readiness = None
+    readiness_file = getattr(args, "delivery_readiness_file", None)
+    if readiness_file is not None:
+        try:
+            with Path(readiness_file).open(encoding="utf-8-sig") as handle:
+                delivery_readiness = json.load(handle)
+        except (OSError, json.JSONDecodeError) as exc:
+            return _err(f"kanban: --delivery-readiness-file: {exc}", 2)
 
     try:
         ws_kind, ws_path = _parse_workspace_flag(args.workspace)
@@ -373,6 +381,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             completion_contract=getattr(args, "completion_contract", None),
+            delivery_readiness=delivery_readiness,
             initial_status=getattr(args, "initial_status", "running"),
             creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
                              if is_dispatcher_owned_worker_context() else None),
