@@ -2804,6 +2804,7 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
 
     from agent.secret_scope import is_multiplex_active
     from tools.environments.local import _is_routed_home, build_subprocess_env, strip_launch_profile_env
+    from tools.environments.local import _hermes_repo_root
 
     try:
         profile_home = resolve_profile_env(profile_arg)
@@ -2896,6 +2897,21 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     env.pop("HERMES_TUI", None)
 
     cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
+    # When _resolve_hermes_argv() selects the module-invocation form (sys.executable -m
+    # hermes_cli.main), the child must be able to import hermes_cli regardless of its cwd.
+    # The dispatcher's process has the Hermes repo root on sys.path (via hermes_bootstrap), so
+    # find_spec("hermes_cli") succeeds in the PARENT and _resolve_hermes_argv picks the module
+    # form. But the child process starts with a clean PYTHONPATH (build_subprocess_env's
+    # _strip_hermes_owned_pythonpath_and_runtime_markers removed it). We must re-add the repo
+    # root so the child's import succeeds. Preserve any existing PYTHONPATH entries (prepend,
+    # don't clobber) — the stripping already removed stale/foreign Hermes-owned entries.
+    if cmd[:3] == [sys.executable, "-m", "hermes_cli.main"]:
+        repo_root = str(_hermes_repo_root)
+        existing_pp = env.get("PYTHONPATH")
+        if existing_pp:
+            env["PYTHONPATH"] = repo_root + os.pathsep + existing_pp
+        else:
+            env["PYTHONPATH"] = repo_root
     # A worker spawned by a managed systemd gateway must leave the gateway's
     # cgroup before startup; otherwise restarting the service kills the worker
     # that is performing the handoff.
