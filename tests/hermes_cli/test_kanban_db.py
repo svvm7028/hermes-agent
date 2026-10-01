@@ -904,6 +904,87 @@ def test_request_review_rollback_discards_staged_copies(kanban_home):
         assert sorted(p.name for p in attachment_dir.iterdir()) == ["evidence.json"]
 
 
+def test_request_review_refuses_self_review_when_assignee_and_reviewer_same(kanban_home):
+    """AC4 regression: a developer-assigned task calling request_review()
+    with no reviewer argument and no prior reviewer provenance (first review
+    ever on this task) where _prior_reviewer() would resolve to the same
+    assignee must be refused (returns False) and leave status unchanged.
+
+    This is the exact incident shape from the bug report (t_fa5bb451,
+    t_c3bd83c7): the dispatcher spawned the same profile into the review
+    slot, which then reviewed its own diff."""
+    with kbc.connect() as conn:
+        # Create a task assigned to "developer" (a real profile)
+        t = kb.create_task(conn, title="self review blocked", assignee="developer")
+        task = kb.get_task(conn, t)
+        assert task.assignee == "developer"
+        assert task.status in ("ready", "running")
+
+        # No prior reviewer provenance exists (first review ever)
+        # Call request_review without explicit reviewer= argument
+        ok = kb.request_review(conn, t, summary="ready for review")
+        assert ok is False, "request_review must refuse self-review when assignee==reviewer"
+
+        # Task status must remain unchanged (NOT moved to 'review')
+        task = kb.get_task(conn, t)
+        assert task.status in ("ready", "running"), f"status must not be 'review', got {task.status}"
+
+        # No review_requested event should be written
+        events = kb.list_events(conn, t)
+        review_requested = [e for e in events if e.kind == "review_requested"]
+        assert len(review_requested) == 0, "no review_requested event should be written when self-review is refused"
+
+
+def test_request_review_allows_self_review_with_force_true(kanban_home):
+    """AC2: force=True is a real escape hatch — when force=True is passed,
+    the same-profile reviewer is allowed and the task transitions to review."""
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="force self review", assignee="developer")
+        kb.claim_task(conn, t)
+        run_id = kb.get_task(conn, t).current_run_id
+        assert run_id is not None
+
+        # force=True should allow the transition despite same-profile
+        ok = kb.request_review(conn, t, summary="force through", expected_run_id=run_id, force=True)
+        assert ok is True, "force=True must allow self-review"
+
+        task = kb.get_task(conn, t)
+        assert task.status == "review", "status must be 'review' when force=True"
+
+        # review_requested event should be written with the reviewer recorded
+        events = kb.list_events(conn, t)
+        review_requested = [e for e in events if e.kind == "review_requested"]
+        assert len(review_requested) == 1
+        assert review_requested[0].payload.get("reviewer") == "developer"
+
+
+def test_request_review_allows_distinct_reviewer(kanban_home):
+    """AC3: a genuinely distinct reviewer (code-reviewer vs developer)
+    must proceed exactly as before — the fix must not block the ordinary
+    distinct-reviewer path."""
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="distinct reviewer", assignee="developer")
+        kb.claim_task(conn, t)
+        run_id = kb.get_task(conn, t).current_run_id
+        assert run_id is not None
+
+        # Explicit distinct reviewer should work
+        ok = kb.request_review(conn, t, summary="distinct reviewer", reviewer="code-reviewer", expected_run_id=run_id)
+        assert ok is True, "distinct reviewer must be allowed"
+
+        task = kb.get_task(conn, t)
+        assert task.status == "review", "status must be 'review'"
+
+        # assignee should be updated to the reviewer
+        assert task.assignee == "code-reviewer"
+
+        # review_requested event should record the distinct reviewer
+        events = kb.list_events(conn, t)
+        review_requested = [e for e in events if e.kind == "review_requested"]
+        assert len(review_requested) == 1
+        assert review_requested[0].payload.get("reviewer") == "code-reviewer"
+
+
 # ---------------------------------------------------------------------------
 # Deferred scratch cleanup for parent/child handoff (#33774)
 # ---------------------------------------------------------------------------
