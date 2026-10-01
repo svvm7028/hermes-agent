@@ -22,21 +22,28 @@ from typing import Any, Callable, MutableMapping
 # Nested A→B→C is one extra turn; this caps a runaway message_agent chain.
 _MAX_QUIET_NOTIFY_ROUNDS = 8
 
-# Last line a Kanban worker leaves in its own log: ``[kanban-worker-exit] rc=<code>``. A per-tick
+# Last line a Kanban worker leaves in its own log: ``[kanban-worker-exit] run=<run_id> rc=<code>``. A per-tick
 # ``hermes kanban dispatch`` process never reaped the worker, so ``os.waitpid`` cannot tell it how
 # the worker exited; the trailer is the process-independent witness the dead-worker sweep reads
 # instead, so a clean exit without a terminal board call is booked as the same protocol violation
-# (and a 75 as the same rate-limit requeue) whichever process notices the death.
-KANBAN_WORKER_EXIT_TRAILER = "[kanban-worker-exit] rc="
+# (and a 75 as the same rate-limit requeue) whichever process notices the death. The ``run=<run_id>``
+# tag prevents a stale trailer from a prior run being misattributed to a later run that died before
+# writing its own trailer (bootstrap/PM/import failure).
+KANBAN_WORKER_EXIT_TRAILER = "[kanban-worker-exit] run="
 
 
 def exit_single_query(code: int) -> None:
     """``sys.exit(code)`` for a one-shot turn; a Kanban worker first writes the exit trailer to its log."""
     if os.environ.get("HERMES_KANBAN_TASK"):
+        run_id = os.environ.get("HERMES_KANBAN_RUN_ID")
         with contextlib.suppress(Exception):
             # stderr: stdout may be the ``--stream-json`` record stream, and the worker log
             # captures both streams.
-            print(f"\n{KANBAN_WORKER_EXIT_TRAILER}{int(code)}", file=sys.stderr, flush=True)
+            if run_id:
+                print(f"\n{KANBAN_WORKER_EXIT_TRAILER}{run_id} rc={int(code)}", file=sys.stderr, flush=True)
+            else:
+                # Fallback for any legacy path that somehow lacks the run ID
+                print(f"\n{KANBAN_WORKER_EXIT_TRAILER}unknown rc={int(code)}", file=sys.stderr, flush=True)
     sys.exit(code)
 
 
