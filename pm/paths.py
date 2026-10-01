@@ -6,45 +6,61 @@ import os
 from pathlib import Path
 
 
-def _resolve_git_dir(git_path: Path) -> Path:
-    """Resolve a .git path to the actual git directory.
+def _parse_worktree_gitdir_pointer(git_path: Path) -> Path | None:
+    """Parse a worktree's .git file (which contains 'gitdir: <path>/.git/worktrees/<name>')
+    and return the main repo root by stripping the known suffix.
     
-    - If .git is a directory, return it.
-    - If .git is a file (worktree), read the 'gitdir:' pointer and return the resolved path.
+    Returns the candidate main repo root path via pure string manipulation (no resolve/stat
+    on the worktree-link target to avoid home_io_guard trips).
     """
-    if git_path.is_dir():
-        return git_path.resolve()
-    # .git is a file (worktree link)
     try:
         content = git_path.read_text().strip()
-        if content.startswith("gitdir: "):
-            gitdir_path = Path(content[8:]).resolve()
-            return gitdir_path
+        if not content.startswith("gitdir: "):
+            return None
+        gitdir_target = content[8:]  # strip 'gitdir: '
+        
+        # The target is <main-repo>/.git/worktrees/<name>
+        # Strip the known suffix to get the main repo root
+        suffix = "/.git/worktrees/"
+        idx = gitdir_target.rfind(suffix)
+        if idx == -1:
+            return None
+        main_repo_root_str = gitdir_target[:idx]
+        return Path(main_repo_root_str)
     except OSError:
-        pass
-    return git_path.resolve()
+        return None
 
 
-def _is_hermes_worktree(git_dir: Path, hermes_repo_git_dir: Path) -> bool:
-    """Check if the given git directory is a worktree belonging to the Hermes repo.
+def _git_dir_main_repo_root(git_path: Path) -> Path | None:
+    """Get the main repo root from a .git path (file or directory) via string ops only.
     
-    A worktree's git directory lives at .git/worktrees/<name> inside the main repo's .git.
+    - If .git is a file (worktree link), parse the gitdir pointer.
+    - If .git is a directory, the main repo root is its parent.
+    
+    Returns normalized path string for comparison, never calls resolve().
     """
     try:
-        # Normalize both paths
-        git_dir = git_dir.resolve()
-        hermes_repo_git_dir = hermes_repo_git_dir.resolve()
-        
-        # Check if git_dir is inside hermes_repo_git_dir/worktrees/
-        worktrees_dir = hermes_repo_git_dir / "worktrees"
-        return worktrees_dir in git_dir.parents or git_dir == worktrees_dir
+        if git_path.is_file():
+            return _parse_worktree_gitdir_pointer(git_path)
+        elif git_path.is_dir():
+            # .git directory -> main repo root is its parent
+            return git_path.parent
+    except OSError:
+        pass
+    return None
+
+
+def _is_path_under(path: Path, parent: Path) -> bool:
+    """Check if path is under parent using string comparison (no resolve)."""
+    try:
+        return os.path.normpath(str(path)).startswith(os.path.normpath(str(parent)) + os.sep)
     except (OSError, ValueError):
         return False
 
 
 def repo_root() -> Path:
     """Return the repository root relevant to the current execution.
-    
+
     • If the current working directory is inside a Git worktree that belongs to
       the same repository as this module's physical location, walk up the CWD
       to find the worktree's top-level directory (the one containing the
@@ -55,46 +71,78 @@ def repo_root() -> Path:
       no Git repo at all, fall back to the physical location of this module –
       which reproduces the original behaviour for normal checkouts and pip/
       pipx/git-installed users.
-    
+
     The key discriminator: a worktree's `.git` is a FILE (not a directory)
     containing `gitdir: <path>/.git/worktrees/<name>`, where `<path>` is inside
     the git dir of the repo it belongs to. We verify the worktree belongs to
-    the Hermes repo before trusting it.
+    the Hermes repo by comparing the parsed main-repo root (from the gitdir
+    pointer's text, via string manipulation only - no resolve/stat on the
+    worktree-link target) against the module's physical repo root before trusting it.
     """
     # The module's physical location - this IS the Hermes repo root for normal checkouts
     module_repo_root = Path(__file__).resolve().parent.parent
     module_git_dir = module_repo_root / ".git"
-    
+
     # If the module location doesn't have a .git, we're in an installed package
     # (pip/pipx/git install) - fall back to module location
     if not module_git_dir.exists():
         return module_repo_root
+
+    # Get the module's main repo root via string ops only (no resolve on .git)
+    module_main_repo = _git_dir_main_repo_root(module_git_dir)
+    if module_main_repo is None:
+        # Can't determine - fall back to module location
+        return module_repo_root
     
-    module_git_dir_resolved = _resolve_git_dir(module_git_dir)
-    
+    module_main_repo_norm = os.path.normpath(str(module_main_repo))
+    module_repo_root_norm = os.path.normpath(str(module_repo_root))
+
     cwd = Path.cwd().resolve()
-    
+    cwd_norm = os.path.normpath(str(cwd))
+
+    # If CWD is the module's repo root (or under it), we're already in the right place.
+    # This avoids walking up and hitting the real hermes home .git during tests.
+    if _is_path_under(cwd, module_repo_root) or cwd_norm == module_repo_root_norm:
+        return module_repo_root
+
     # Walk upward looking for a .git directory or a .git file (worktree link)
     for parent in [cwd] + list(cwd.parents):
+        parent_norm = os.path.normpath(str(parent))
+        
+        # Stop if we've reached the module's main repo root (the real hermes home)
+        # This prevents hitting the home_io_guard during test collection when
+        # CWD is the main repo and the module lives in a worktree.
+        if parent_norm == module_main_repo_norm:
+            break
+            
+        # Also stop if we've walked past the module's physical repo root
+        if parent_norm == module_repo_root_norm:
+            break
+            
         git_path = parent / ".git"
         if git_path.exists():
-            found_git_dir = _resolve_git_dir(git_path)
-            
             if git_path.is_file():
-                # This is a worktree (.git file). Check if it belongs to the Hermes repo.
-                if _is_hermes_worktree(found_git_dir, module_git_dir_resolved):
-                    # It's a Hermes worktree - return the worktree root (parent of .git file)
-                    return parent.resolve()
+                # This is a worktree (.git file). Parse the gitdir pointer via string
+                # manipulation ONLY - no resolve/stat on the target to avoid
+                # home_io_guard trips (the target is inside the install's main .git dir).
+                parsed_main_repo = _parse_worktree_gitdir_pointer(git_path)
+                if parsed_main_repo is not None:
+                    # Compare via normalized string paths (no resolve)
+                    if os.path.normpath(str(parsed_main_repo)) == module_main_repo_norm:
+                        # It's a Hermes worktree - return the worktree root (parent of .git file)
+                        return parent.resolve()
                 # It's a worktree but NOT for the Hermes repo - ignore and continue walking
                 continue
             else:
                 # This is a regular .git directory (ordinary repo).
-                # Check if it's the SAME repo as the module location (e.g., running from main repo)
-                if found_git_dir == module_git_dir_resolved:
-                    return parent.resolve()
+                # Get its main repo root via string ops and compare with module's
+                found_main_repo = _git_dir_main_repo_root(git_path)
+                if found_main_repo is not None:
+                    if os.path.normpath(str(found_main_repo)) == module_main_repo_norm:
+                        return parent.resolve()
                 # It's an UNRELATED git repo - DO NOT TRUST IT. Fall through to module default.
                 break
-    
+
     return module_repo_root
 
 
@@ -140,8 +188,7 @@ def partials_root() -> Path:
     (WindowsApps/agent-payload), and partials are mutable state the
     downloader writes continuously, so they must land somewhere writable
     on every install kind: ``%LOCALAPPDATA%\\hermes\\cache\\partials`` on
-    Windows, ``~/.hermes/cache/partials`` on POSIX.
-    """
+    Windows, ``~/.hermes/cache/partials`` on POSIX."""
     from hermes_constants import get_default_hermes_root
 
     return get_default_hermes_root() / "cache" / "partials"
