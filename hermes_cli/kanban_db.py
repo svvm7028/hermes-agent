@@ -3565,11 +3565,17 @@ def request_review(
                 reviewer = _prior_reviewer(conn, task_id)
                 if reviewer is False:
                     return _ret(
-                        False, "re-review has no durable reviewer provenance (the "
-                        "latest changes_requested event is missing or "
-                        "malformed); pass reviewer= explicitly",
+                        False, "re-review has no durable reviewer provenance (the latest changes_requested event is missing or malformed); pass reviewer= explicitly",
                     )
+            # Resolve canonical assignee (for both explicit reviewer and resolved from _prior_reviewer)
             reviewer = _canonical_assignee(reviewer)
+            # Guard against reviewer being same as current assignee (unless force=True)
+            # This applies whether reviewer was explicit or resolved from _prior_reviewer.
+            # Only refuse when BOTH are genuine non-None profiles; an unassigned task
+            # (assignee IS NULL) has no self-review risk and must not be blocked.
+            resolved_reviewer = reviewer if reviewer is not None else trow["assignee"]
+            if resolved_reviewer is not None and resolved_reviewer == trow["assignee"] and not force:
+                return _ret(False, "reviewer is same as current assignee")
             # The actor is the run that did the work. ``assignee`` is the actor
             # only while a worker holds the card; on a never-claimed card it is
             # whoever the operator assigned -- possibly the reviewer itself,
@@ -3585,12 +3591,16 @@ def request_review(
                     (trow["current_run_id"],),
                 ).fetchone()
                 implementer = arow["profile"] if arow else None
-            if implementer is None and trow["assignee"] != reviewer:
+            if implementer is None and trow["assignee"] != resolved_reviewer:
                 implementer = trow["assignee"]
-            assignee_sql = ", assignee = ?" if reviewer is not None else ""
+
+            # Use resolved_reviewer (the actual reviewer identity) for the assignee update
+            # and the event payload. This correctly handles both explicit reviewers
+            # and the force=True self-review case where resolved_reviewer == assignee.
+            assignee_sql = ", assignee = ?" if resolved_reviewer is not None else ""
             run_guard = "" if expected_run_id is None else " AND current_run_id = ?"
             params: tuple[Any, ...] = (
-                *(() if reviewer is None else (reviewer,)), task_id,
+                *(() if resolved_reviewer is None else (resolved_reviewer,)), task_id,
                 *(() if expected_run_id is None else (int(expected_run_id),)),
             )
             cur = conn.execute(
@@ -3622,7 +3632,7 @@ def request_review(
             payload: dict = {
                 "summary": _first_line(summary, 400) or None,
                 "implementer": implementer,
-                "reviewer": reviewer,
+                "reviewer": resolved_reviewer,
             }
             staged = _cleaned_artifact_paths(metadata)
             if staged:
