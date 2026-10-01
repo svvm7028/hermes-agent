@@ -66,7 +66,7 @@ def repo_root() -> Path:
       to find the worktree's top-level directory (the one containing the
       `.git` file that links to the actual repo). The returned `Path` is the
       *worktree root*.
-      
+     
     • If the CWD is inside an unrelated Git repo (ordinary .git directory) or
       no Git repo at all, fall back to the physical location of this module –
       which reproduces the original behaviour for normal checkouts and pip/
@@ -94,31 +94,23 @@ def repo_root() -> Path:
         # Can't determine - fall back to module location
         return module_repo_root
     
-    module_main_repo_norm = os.path.normpath(str(module_main_repo))
-    module_repo_root_norm = os.path.normpath(str(module_repo_root))
+    # Use realpath for comparison to handle symlinks (e.g. /var -> /private/var on macOS)
+    # This does NOT resolve the worktree-link target - just normalizes symlinks in
+    # the already-resolved module path and the parsed string from gitdir pointer.
+    module_main_repo_norm = os.path.normpath(os.path.realpath(str(module_main_repo)))
+    module_repo_root_norm = os.path.normpath(os.path.realpath(str(module_repo_root)))
 
     cwd = Path.cwd().resolve()
-    cwd_norm = os.path.normpath(str(cwd))
-
-    # If CWD is the module's repo root (or under it), we're already in the right place.
-    # This avoids walking up and hitting the real hermes home .git during tests.
-    if _is_path_under(cwd, module_repo_root) or cwd_norm == module_repo_root_norm:
-        return module_repo_root
+    cwd_norm = os.path.normpath(os.path.realpath(str(cwd)))
 
     # Walk upward looking for a .git directory or a .git file (worktree link)
+    # Check each parent's .git FIRST before applying boundary checks, so we can
+    # discover a closer/nested worktree .git file before falling back to the
+    # module location. This fixes the case where module is in main repo and
+    # cwd is in a nested worktree under it.
     for parent in [cwd] + list(cwd.parents):
         parent_norm = os.path.normpath(str(parent))
         
-        # Stop if we've reached the module's main repo root (the real hermes home)
-        # This prevents hitting the home_io_guard during test collection when
-        # CWD is the main repo and the module lives in a worktree.
-        if parent_norm == module_main_repo_norm:
-            break
-            
-        # Also stop if we've walked past the module's physical repo root
-        if parent_norm == module_repo_root_norm:
-            break
-            
         git_path = parent / ".git"
         if git_path.exists():
             if git_path.is_file():
@@ -127,8 +119,10 @@ def repo_root() -> Path:
                 # home_io_guard trips (the target is inside the install's main .git dir).
                 parsed_main_repo = _parse_worktree_gitdir_pointer(git_path)
                 if parsed_main_repo is not None:
-                    # Compare via normalized string paths (no resolve)
-                    if os.path.normpath(str(parsed_main_repo)) == module_main_repo_norm:
+                    # Compare via normalized realpath paths (handles symlinks like /var -> /private/var)
+                    # This does NOT call resolve() on the worktree-link target - just realpath
+                    # on the parsed string from the gitdir pointer text.
+                    if os.path.normpath(os.path.realpath(str(parsed_main_repo))) == module_main_repo_norm:
                         # It's a Hermes worktree - return the worktree root (parent of .git file)
                         return parent.resolve()
                 # It's a worktree but NOT for the Hermes repo - ignore and continue walking
@@ -142,6 +136,16 @@ def repo_root() -> Path:
                         return parent.resolve()
                 # It's an UNRELATED git repo - DO NOT TRUST IT. Fall through to module default.
                 break
+
+        # After checking this parent's .git, stop if we've reached the module's main repo root
+        # (the real hermes home). This prevents hitting the home_io_guard during test collection
+        # when CWD is the main repo and the module lives in a worktree.
+        if parent_norm == module_main_repo_norm:
+            break
+           
+        # Also stop if we've walked past the module's physical repo root
+        if parent_norm == module_repo_root_norm:
+            break
 
     return module_repo_root
 

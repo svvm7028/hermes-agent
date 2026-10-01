@@ -48,225 +48,17 @@ def make_unrelated_repo(base: Path) -> Path:
 def write_test_paths_module(target_dir: Path, module_repo_root: Path | None = None) -> Path:
     """Write a test pm.paths module to target_dir/pm/paths.py.
     
-    If module_repo_root is provided, the module will use that as its __file__ base.
-    Otherwise it uses target_dir as the module location.
+    Reads the ACTUAL pm/paths.py source from the real repo to avoid staleness.
+    The test file lives in tests/pm/, so the real pm/paths.py is at parents[2] / "pm" / "paths.py".
     """
     pm_dir = target_dir / "pm"
     pm_dir.mkdir(parents=True, exist_ok=True)
     
-    paths_py = '''"""Where the store, lockfile, and installed-state file live."""
-
-from __future__ import annotations
-
-import os
-from pathlib import Path
-
-
-def _parse_worktree_gitdir_pointer(git_path: Path) -> Path | None:
-    """Parse a worktree's .git file (which contains 'gitdir: <path>/.git/worktrees/<name>')
-    and return the main repo root by stripping the known suffix.
+    # Read the real pm/paths.py from the repo (this test file is in tests/pm/)
+    repo_root = Path(__file__).resolve().parents[2]
+    real_paths_py = repo_root / "pm" / "paths.py"
+    paths_py = real_paths_py.read_text()
     
-    Returns the candidate main repo root path via pure string manipulation (no resolve/stat
-    on the worktree-link target to avoid home_io_guard trips).
-    """
-    try:
-        content = git_path.read_text().strip()
-        if not content.startswith("gitdir: "):
-            return None
-        gitdir_target = content[8:]  # strip 'gitdir: '
-        
-        # The target is <main-repo>/.git/worktrees/<name>
-        # Strip the known suffix to get the main repo root
-        suffix = "/.git/worktrees/"
-        idx = gitdir_target.rfind(suffix)
-        if idx == -1:
-            return None
-        main_repo_root_str = gitdir_target[:idx]
-        return Path(main_repo_root_str)
-    except OSError:
-        return None
-
-
-def _git_dir_main_repo_root(git_path: Path) -> Path | None:
-    """Get the main repo root from a .git path (file or directory) via string ops only.
-    
-    - If .git is a file (worktree link), parse the gitdir pointer.
-    - If .git is a directory, the main repo root is its parent.
-    
-    Returns normalized path string for comparison, never calls resolve().
-    """
-    try:
-        if git_path.is_file():
-            return _parse_worktree_gitdir_pointer(git_path)
-        elif git_path.is_dir():
-            # .git directory -> main repo root is its parent
-            return git_path.parent
-    except OSError:
-        pass
-    return None
-
-
-def _is_path_under(path: Path, parent: Path) -> bool:
-    """Check if path is under parent using string comparison (no resolve)."""
-    try:
-        return os.path.normpath(str(path)).startswith(os.path.normpath(str(parent)) + os.sep)
-    except (OSError, ValueError):
-        return False
-
-
-def repo_root() -> Path:
-    """Return the repository root relevant to the current execution.
-
-    • If the current working directory is inside a Git worktree that belongs to
-      the same repository as this module's physical location, walk up the CWD
-      to find the worktree's top-level directory (the one containing the
-      `.git` file that links to the actual repo). The returned `Path` is the
-      *worktree root*.
-      
-    • If the CWD is inside an unrelated Git repo (ordinary .git directory) or
-      no Git repo at all, fall back to the physical location of this module –
-      which reproduces the original behaviour for normal checkouts and pip/
-      pipx/git-installed users.
-
-    The key discriminator: a worktree's `.git` is a FILE (not a directory)
-    containing `gitdir: <path>/.git/worktrees/<name>`, where `<path>` is inside
-    the git dir of the repo it belongs to. We verify the worktree belongs to
-    the Hermes repo by comparing the parsed main-repo root (from the gitdir
-    pointer's text, via string manipulation only - no resolve/stat on the
-    worktree-link target) against the module's physical repo root before trusting it.
-    """
-    # The module's physical location - this IS the Hermes repo root for normal checkouts
-    module_repo_root = Path(__file__).resolve().parent.parent
-    module_git_dir = module_repo_root / ".git"
-
-    # If the module location doesn't have a .git, we're in an installed package
-    # (pip/pipx/git install) - fall back to module location
-    if not module_git_dir.exists():
-        return module_repo_root
-
-    # Get the module's main repo root via string ops only (no resolve on .git)
-    module_main_repo = _git_dir_main_repo_root(module_git_dir)
-    if module_main_repo is None:
-        # Can't determine - fall back to module location
-        return module_repo_root
-    
-    module_main_repo_norm = os.path.normpath(str(module_main_repo))
-    module_repo_root_norm = os.path.normpath(str(module_repo_root))
-
-    cwd = Path.cwd().resolve()
-    cwd_norm = os.path.normpath(str(cwd))
-
-    # If CWD is the module's repo root (or under it), we're already in the right place.
-    # This avoids walking up and hitting the real hermes home .git during tests.
-    if _is_path_under(cwd, module_repo_root) or cwd_norm == module_repo_root_norm:
-        return module_repo_root
-
-    # Walk upward looking for a .git directory or a .git file (worktree link)
-    for parent in [cwd] + list(cwd.parents):
-        parent_norm = os.path.normpath(str(parent))
-        
-        # Stop if we've reached the module's main repo root (the real hermes home)
-        # This prevents hitting the home_io_guard during test collection when
-        # CWD is the main repo and the module lives in a worktree.
-        if parent_norm == module_main_repo_norm:
-            break
-            
-        # Also stop if we've walked past the module's physical repo root
-        if parent_norm == module_repo_root_norm:
-            break
-            
-        git_path = parent / ".git"
-        if git_path.exists():
-            if git_path.is_file():
-                # This is a worktree (.git file). Parse the gitdir pointer via string
-                # manipulation ONLY - no resolve/stat on the target to avoid
-                # home_io_guard trips (the target is inside the install's main .git dir).
-                parsed_main_repo = _parse_worktree_gitdir_pointer(git_path)
-                if parsed_main_repo is not None:
-                    # Compare via normalized string paths (no resolve)
-                    if os.path.normpath(str(parsed_main_repo)) == module_main_repo_norm:
-                        # It's a Hermes worktree - return the worktree root (parent of .git file)
-                        return parent.resolve()
-                # It's a worktree but NOT for the Hermes repo - ignore and continue walking
-                continue
-            else:
-                # This is a regular .git directory (ordinary repo).
-                # Get its main repo root via string ops and compare with module's
-                found_main_repo = _git_dir_main_repo_root(git_path)
-                if found_main_repo is not None:
-                    if os.path.normpath(str(found_main_repo)) == module_main_repo_norm:
-                        return parent.resolve()
-                # It's an UNRELATED git repo - DO NOT TRUST IT. Fall through to module default.
-                break
-
-    return module_repo_root
-
-
-def install_root() -> Path:
-    """The tree this process runs from. ``HERMES_INSTALL_ROOT`` when a steward
-    wrapper sets it (Nix points it at the sealed tree whose install stamp lives
-    outside the package dir), else the executing checkout."""
-    env = os.environ.get("HERMES_INSTALL_ROOT")
-    return Path(env) if env else repo_root()
-
-
-def install_stamp_path(project_root: Path) -> Path:
-    """THE stamp location for ``project_root``, shared by every stamp reader.
-
-    Beside the code in checkouts, Docker and desktop payloads. A Nix package
-    bakes the stamp outside the store's package dir and its wrapper carries
-    ``HERMES_INSTALL_ROOT`` for the executing tree only — so the executing
-    tree resolves through install_root, any other tree is taken literally.
-    PM reads it in sealed stages (the Docker runtime base) before hermes_cli
-    ships, so it lives here rather than beside the stewards.
-    """
-    root = Path(project_root)
-    if root.resolve() == repo_root():
-        root = install_root()
-    return root / "install-stamp.json"
-
-
-def lockfile_path() -> Path:
-    return Path(__file__).resolve().parent / "lock.json"
-
-
-def store_root() -> Path:
-    from pm.environments import store_root as resolve
-
-    return resolve(repo_root())
-
-
-def partials_root() -> Path:
-    """The downloader's managed partials area: machine-scoped and shared
-    (keyed by sha256(url), so two callers or two profiles reuse one
-    partial), but anchored to the DEFAULT hermes root — NOT the byte
-    store. The store can live inside a read-only sealed payload
-    (WindowsApps/agent-payload), and partials are mutable state the
-    downloader writes continuously, so they must land somewhere writable
-    on every install kind: ``%LOCALAPPDATA%\\\\hermes\\\\cache\\\\partials`` on
-    Windows, ``~/.hermes/cache/partials`` on POSIX."""
-    from hermes_constants import get_default_hermes_root
-
-    return get_default_hermes_root() / "cache" / "partials"
-
-
-def facts_path() -> Path:
-    return store_root() / "facts.json"
-
-
-def writable_store_root() -> Path:
-    if not (store_root().parent / "manifest.json").is_file():
-        return store_root()
-    from hermes_constants import get_default_hermes_root
-
-    return get_default_hermes_root() / "tools"
-
-
-def runtime_facts_path() -> Path:
-    from pm.environments import runtime_facts_path as resolve
-
-    return resolve(repo_root())
-'''
     (pm_dir / "paths.py").write_text(paths_py)
     (pm_dir / "__init__.py").write_text("")
     return pm_dir
@@ -473,6 +265,58 @@ def test_repo_root_same_repo_not_worktree(tmp_path):
         rr = test_module.repo_root().resolve()
         assert rr == hermes_repo.resolve(), (
             f"repo_root()={rr} but expected hermes_repo={hermes_repo.resolve()}"
+        )
+    finally:
+        os.chdir(old_cwd)
+        for key in list(sys.modules.keys()):
+            if key.startswith("test_pm_paths"):
+                del sys.modules[key]
+
+
+def test_repo_root_nested_worktree_under_main_repo(tmp_path):
+    """Case 1a (nested topology): Module in main repo, cwd in a worktree NESTED under main repo.
+
+    This is the exact topology this project uses: the pm/paths.py module physically lives in
+    the MAIN repo (e.g. /Users/.../.hermes/hermes-agent), and kanban workspaces are worktrees
+    nested under it (e.g. .worktrees/t_d9977f07). When running from the nested worktree,
+    repo_root() must resolve to the worktree root, not the outer main repo.
+
+    The bug was a short-circuit that returned the module's repo root whenever cwd was under
+    it, BEFORE checking for a closer nested worktree .git file.
+    """
+    # Create the "Hermes" main repo (where the module actually lives)
+    hermes_repo = tmp_path / "hermes-repo"
+    hermes_repo.mkdir()
+    subprocess.run(["git", "init", "--quiet"], cwd=hermes_repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=hermes_repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=hermes_repo, check=True)
+    (hermes_repo / "README.md").write_text("# Hermes Repo\n")
+    subprocess.run(["git", "add", "."], cwd=hermes_repo, check=True)
+    subprocess.run(["git", "commit", "-m", "init", "--quiet"], cwd=hermes_repo, check=True)
+
+    # Create a worktree NESTED under the main repo (not a tmp_path sibling!)
+    # This mimics .worktrees/<task> under the main hermes-agent repo
+    nested_worktree = hermes_repo / ".worktrees" / "nested-task"
+    nested_worktree.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "worktree", "add", str(nested_worktree), "HEAD"], cwd=hermes_repo, check=True)
+
+    # Write test module to the MAIN repo (not the worktree)
+    # This simulates pm/paths.py living in the main hermes-agent repo
+    write_test_paths_module(hermes_repo)
+
+    # Change to the NESTED worktree and test
+    old_cwd = os.getcwd()
+    try:
+        os.chdir(nested_worktree)
+
+        # Load the test module from the MAIN repo location
+        test_module = load_module_from_path("test_pm_paths_nested", hermes_repo / "pm" / "paths.py")
+
+        rr = test_module.repo_root().resolve()
+        # MUST resolve to the worktree root, NOT the main repo
+        assert rr == nested_worktree.resolve(), (
+            f"repo_root()={rr} but expected nested worktree={nested_worktree.resolve()}. "
+            f"BUG: Returned main repo={hermes_repo.resolve()} instead of worktree root"
         )
     finally:
         os.chdir(old_cwd)
