@@ -429,6 +429,86 @@ def test_terminal_provider_exit_blocks_after_one_attempt_in_either_lane(kanban_h
 
 
 
+# ---------------------------------------------------------------------------
+# Stale trailer regression: a worker that dies BEFORE writing its own exit
+# trailer must not inherit a prior run's trailer (rate-limit or otherwise).
+# Regression for the bug where _worker_log_exit_code read the last trailer in
+# the log regardless of run_id, misclassifying bootstrap/PM failures as
+# rate_limited when a previous run had hit a quota wall.
+# ---------------------------------------------------------------------------
+
+
+def test_stale_trailer_not_inherited_by_later_run(kanban_home, monkeypatch):
+    """A worker that dies in bootstrap (before writing a trailer) must not be
+    classified as rate_limited just because a previous run on the same task
+    wrote a rate-limit trailer. The classifier must match on run_id.
+    """
+    import hermes_cli.kanban_db as _kb
+    from hermes_cli import kanban_db_dispatch as _kbd
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kbc.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="stale-trailer", assignee="a")
+
+        # --- Run 1: genuine rate limit (exit code 75), writes trailer with run_id=1 ---
+        pid1 = 80001
+        kb.claim_task(conn, tid, claimer=f"{host}:w1")
+        # Simulate run_id = 1
+        conn.execute(
+            "UPDATE tasks SET worker_pid=?, current_run_id=1 WHERE id=?",
+            (pid1, tid),
+        )
+        conn.commit()
+        _kbd._record_worker_exit(pid1, _exited_status(_kb.KANBAN_RATE_LIMIT_EXIT_CODE))
+
+        crashed = _kbd.detect_crashed_workers(conn)
+        assert tid not in crashed
+        rl = getattr(_kbd.detect_crashed_workers, "_last_rate_limited", [])
+        assert tid in rl
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert task.consecutive_failures == 0
+
+        # --- Run 2: dies in bootstrap (exit code 1), NO trailer written ---
+        # This simulates a worker dying in hermes_bootstrap.py's activate_dependencies()
+        # before quiet_single_query.exit_single_query is ever reached.
+        pid2 = 80002
+        kb.claim_task(conn, tid, claimer=f"{host}:w2")
+        # Simulate run_id = 2 (different from run 1)
+        conn.execute(
+            "UPDATE tasks SET worker_pid=?, current_run_id=2 WHERE id=?",
+            (pid2, tid),
+        )
+        conn.commit()
+        # Record a NON-rate-limit exit (bootstrap failure)
+        _kbd._record_worker_exit(pid2, _exited_status(1))
+
+        crashed = _kbd.detect_crashed_workers(conn)
+        # This run should be a genuine crash, NOT rate_limited
+        assert tid in crashed
+        rl = getattr(_kbd.detect_crashed_workers, "_last_rate_limited", [])
+        assert tid not in rl, "Run 2 must NOT be classified as rate_limited (stale trailer)"
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"  # crash with failure_limit > 1 goes back to ready
+        assert task.consecutive_failures == 1  # this crash counts as a failure
+
+        # Verify the run outcome is "crashed", not "rate_limited"
+        outcomes = [
+            r["outcome"]
+            for r in conn.execute(
+                "SELECT outcome FROM task_runs WHERE task_id=? ORDER BY id", (tid,)
+            ).fetchall()
+        ]
+        assert outcomes == ["rate_limited", "crashed"], f"Got outcomes: {outcomes}"
+
+
+# ---------------------------------------------------------------------------
+# Respawn guard (check_respawn_guard + dispatch_once integration)
+# ---------------------------------------------------------------------------
+
 
 def test_respawn_guard_defers_rate_limited_within_cooldown(
     kanban_home, monkeypatch,
